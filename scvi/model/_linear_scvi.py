@@ -12,6 +12,9 @@ from scvi.model.base import UnsupervisedTrainingMixin
 from scvi.module import LDVAE
 from scvi.utils import setup_anndata_dsp
 
+import torch
+from torch.utils.tensorboard import SummaryWriter
+
 from .base import BaseModelClass, RNASeqMixin, VAEMixin
 
 logger = logging.getLogger(__name__)
@@ -118,6 +121,8 @@ class LinearSCVI(RNASeqMixin, VAEMixin, UnsupervisedTrainingMixin, BaseModelClas
         )
         self.n_latent = n_latent
         self.init_params_ = self._get_init_params(locals())
+
+        self.module.tbwriter = SummaryWriter()
 
     def get_loadings(self) -> pd.DataFrame:
         """

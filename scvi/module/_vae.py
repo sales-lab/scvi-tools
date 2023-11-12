@@ -210,6 +210,8 @@ class VAE(BaseMinifiedModeModuleClass):
             scale_activation="softplus" if use_size_factor_key else "softmax",
         )
 
+        self.step = 0
+
     def _get_inference_input(
         self,
         tensors,
@@ -439,7 +441,12 @@ class VAE(BaseMinifiedModeModuleClass):
         kl_weight: float = 1.0,
     ):
         """Computes the loss function for the model."""
+        # import pdb
+        # pdb.set_trace()
+
         x = tensors[REGISTRY_KEYS.X_KEY]
+        y = tensors[REGISTRY_KEYS.LABELS_KEY].flatten()
+
         kl_divergence_z = kl(inference_outputs["qz"], generative_outputs["pz"]).sum(
             dim=1
         )
@@ -457,8 +464,19 @@ class VAE(BaseMinifiedModeModuleClass):
         kl_local_no_warmup = kl_divergence_l
 
         weighted_kl_local = kl_weight * kl_local_for_warmup + kl_local_no_warmup
+        weighted_kl_local *= 50
 
-        loss = torch.mean(reconst_loss + weighted_kl_local)
+        loss_vi = torch.mean(reconst_loss + weighted_kl_local)
+        loss_nca = self._nca_loss(inference_outputs["z"], y)
+
+        loss = loss_vi + loss_nca[2]
+
+        if self.training and self.tbwriter:
+            self.tbwriter.add_scalar("Reconstruction", torch.mean(reconst_loss), self.step)
+            self.tbwriter.add_scalar("KL", torch.mean(weighted_kl_local), self.step)
+            self.tbwriter.add_scalar("Classification", loss_nca[1], self.step)
+            self.tbwriter.add_scalar("Hinge", loss_nca[2], self.step)
+        self.step += 1
 
         kl_local = dict(
             kl_divergence_l=kl_divergence_l, kl_divergence_z=kl_divergence_z
@@ -466,6 +484,82 @@ class VAE(BaseMinifiedModeModuleClass):
         return LossOutput(
             loss=loss, reconstruction_loss=reconst_loss, kl_local=kl_local
         )
+
+    def _nca_loss(self, Z, y):
+        # compute pairwise boolean class matrix
+        y_mask = y[:, None] == y[None, :]
+
+        mu = Z.mean(dim=0)
+        sd = Z.std(dim=0)
+        Z = (Z - mu) / sd / 10
+
+        # compute pairwise squared Euclidean distances
+        # in transformed space
+        distances = self._pairwise_l2_sq(Z)
+
+        # fill diagonal values such that exponentiating them
+        # makes them equal to 0
+        distances.diagonal().copy_(np.inf*torch.ones(len(distances)))
+        #distances.diagonal().copy_(1e3*torch.ones(len(distances)))
+
+        # compute pairwise probability matrix p_ij
+        # defined by a softmax over negative squared
+        # distances in the transformed space.
+        # since we are dealing with negative values
+        # with the largest value being 0, we need
+        # not worry about numerical instabilities
+        # in the softmax function
+        p_ij = self._softmax(-distances)
+
+        # for each p_i, zero out any p_ij that
+        # is not of the same class label as i
+        p_ij_mask = p_ij * y_mask.float()
+
+        # sum over js to compute p_i
+        p_i = p_ij_mask.sum(dim=1)
+
+        # compute expected number of points
+        # correctly classified by summing
+        # over all p_i's.
+        # to maximize the above expectation
+        # we can negate it and feed it to
+        # a minimizer
+        # for numerical stability, we only
+        # log_sum over non-zero values
+        classification_loss = -torch.log(torch.masked_select(p_i, p_i != 0)).sum()
+
+        # to prevent the embeddings of different
+        # classes from collapsing to the same
+        # point, we add a hinge loss penalty
+        distances.diagonal().copy_(torch.zeros(len(distances)))
+        margin_diff = (1 - distances) * (~y_mask).float()
+        hinge_loss = torch.clamp(margin_diff, min=0).pow(2).sum(1).mean()
+
+        # sum both loss terms and return
+        loss = classification_loss + hinge_loss
+        return loss, classification_loss, hinge_loss
+
+    @staticmethod
+    def _pairwise_l2_sq(x):
+        """Compute pairwise squared Euclidean distances.
+        """
+        dot = torch.mm(x.double(), torch.t(x.double()))
+        norm_sq = torch.diag(dot)
+        dist = norm_sq[None, :] - 2*dot + norm_sq[:, None]
+        dist = torch.clamp(dist, min=0)  # replace negative values with 0
+        return dist.float()
+
+    @staticmethod
+    def _softmax(x):
+        """Compute row-wise softmax.
+
+        Notes:
+        Since the input to this softmax is the negative of the
+        pairwise L2 distances, we don't need to do the classical
+        numerical stability trick.
+        """
+        exp = torch.exp(x)
+        return exp / (exp.sum(dim=1) + 1e-16)
 
     @torch.inference_mode()
     def sample(

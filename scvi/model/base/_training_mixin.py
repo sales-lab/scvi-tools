@@ -19,7 +19,7 @@ class UnsupervisedTrainingMixin:
         use_gpu: Optional[Union[str, int, bool]] = None,
         train_size: float = 0.9,
         validation_size: Optional[float] = None,
-        batch_size: int = 128,
+        batch_size: int = 2048,
         early_stopping: bool = False,
         plan_kwargs: Optional[dict] = None,
         **trainer_kwargs,
